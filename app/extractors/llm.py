@@ -89,9 +89,6 @@ class LLMExtractor(BaseExtractor):
         if rule.llm_config is None:
             raise ValueError("llm_config is required for LLM extraction.")
 
-        if not rule.llm_config.selectors:
-            raise ValueError("llm_config.selectors must not be empty.")
-
         if not rule.llm_config.instruction.strip():
             raise ValueError("llm_config.instruction must not be empty.")
 
@@ -171,7 +168,7 @@ class LLMExtractor(BaseExtractor):
         Resolve the best input content for the LLM.
 
         Prefer selector-scoped content because it is narrower and cheaper.
-        Fall back to full-page text only if needed.
+        Fall back to full-page text when selectors are omitted or yield nothing.
         """
         blocks = all_matching_selectors(soup, selectors)
 

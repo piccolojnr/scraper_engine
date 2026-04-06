@@ -170,7 +170,7 @@ class TableExtractConfig(BaseModel):
 class LLMExtractConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    selectors: list[str] = Field(default_factory=list, min_length=1)
+    selectors: list[str] = Field(default_factory=list)
     instruction: str
     output_schema_name: str | None = None
 

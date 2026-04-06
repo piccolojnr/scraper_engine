@@ -12,7 +12,9 @@ from app.runner.page_runner import PageRunner
 from app.runner.university_runner import UniversityRunner
 from app.runtime.browser_client import PlaywrightBrowserClient
 from app.runtime.http_client import SimpleHttpClient
+from app.runtime.openai_llm_client import OpenAILLMClient
 from app.schemas.results import UniversityRunResult
+from app.settings import get_settings
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,12 +65,14 @@ async def run_once(
     registry.clear()
     registry.load_package(configs_package, Path(configs_dir))
     config = registry.get(config_id)
+    settings = get_settings()
+    llm_client = OpenAILLMClient.from_env()
 
     async with SimpleHttpClient(
         default_headers={
             "User-Agent": "UniScraper/1.0",
         },
-        verify_ssl=False,  # some university sites have bad SSL configs - disable verification for now
+        verify_ssl=settings.http_client.verify_ssl,
     ) as http_client, PlaywrightBrowserClient(
         headless=not headed,
         browser_type=browser,
@@ -77,7 +81,7 @@ async def run_once(
         },
     ) as browser_client:
         extractor_factory = ExtractorFactory(
-            llm_client=None,  # plug in your real LLM client later
+            llm_client=llm_client,
         )
 
         page_runner = PageRunner(
@@ -175,6 +179,8 @@ async def async_main() -> int:
 
 
 def main() -> None:
+    if OpenAILLMClient.from_env() is not None:
+        print("OpenAI LLM client enabled from environment.")
     raise SystemExit(asyncio.run(async_main()))
 
 

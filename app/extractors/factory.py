@@ -38,7 +38,6 @@ class ExtractorFactory:
     ) -> None:
         self._llm_client = llm_client
 
-        # Reusable stateless extractor instances
         self._selector = SelectorExtractor()
         self._keyword = KeywordExtractor()
         self._pattern = PatternExtractor()

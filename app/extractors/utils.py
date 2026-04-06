@@ -358,7 +358,8 @@ def table_to_rows(table: Tag, header_row_index: int = 0) -> list[list[str]]:
     """
     Convert an HTML table into raw row/cell text.
 
-    This returns rows only. Header interpretation is left to the caller.
+    If header_row_index points at a valid row, that row is treated as the
+    header row and excluded from the returned data rows.
     """
     rows: list[list[str]] = []
 
@@ -374,8 +375,13 @@ def table_to_rows(table: Tag, header_row_index: int = 0) -> list[list[str]]:
     if not rows:
         return []
 
-    # header_row_index is accepted here for interface consistency,
-    # but row shaping is intentionally left simple for v1.
+    if 0 <= header_row_index < len(rows):
+        return [
+            row
+            for index, row in enumerate(rows)
+            if index != header_row_index
+        ]
+
     return rows
 
 
