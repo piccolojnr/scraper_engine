@@ -88,8 +88,10 @@ def test_save_and_get_run(tmp_path) -> None:
 
     assert fetched is not None
     assert fetched.run_id == saved.run_id
-    assert fetched.result.university_id == "example"
-    assert fetched.result.page_results[0].page_name == "profile"
+    assert fetched.university_id == "example"
+    assert fetched.normalized is not None
+    assert fetched.normalized.university is not None
+    assert fetched.normalized.university.name == "Example University"
     assert fetched.logs == ["started", "finished"]
 
 
@@ -108,4 +110,4 @@ def test_get_latest_run_returns_most_recent(tmp_path) -> None:
 
     assert fetched is not None
     assert fetched.run_id == latest_saved.run_id
-    assert fetched.result.finished_at == latest_result.finished_at
+    assert fetched.finished_at == latest_result.finished_at

@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.config.registry import registry
+from app.config.models import UniversityScraperConfig
+from app.config.registry import ConfigRegistry
 from app.persistence.models import PersistedRun
 from app.persistence.repositories import RunRepository
 from app.runner.university_runner import UniversityRunner
@@ -26,6 +27,16 @@ class ScrapeService:
         self.university_runner = university_runner
         self.run_repository = run_repository
 
+    @staticmethod
+    def load_configs(
+        *,
+        configs_package: str,
+        configs_dir: str,
+    ) -> list[UniversityScraperConfig]:
+        config_registry = ConfigRegistry()
+        config_registry.load_package(configs_package, Path(configs_dir))
+        return config_registry.all()
+
     async def run(
         self,
         *,
@@ -33,9 +44,9 @@ class ScrapeService:
         configs_package: str,
         configs_dir: str,
     ) -> ScrapeExecution:
-        registry.clear()
-        registry.load_package(configs_package, Path(configs_dir))
-        config = registry.get(config_id)
+        config_registry = ConfigRegistry()
+        config_registry.load_package(configs_package, Path(configs_dir))
+        config = config_registry.get(config_id)
 
         execution = await self.university_runner.run_with_context(config)
         persisted_run = None

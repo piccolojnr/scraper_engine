@@ -4,8 +4,9 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_STATEMENTS = (
-    """
+CURRENT_SCHEMA_VERSION = 2
+
+RUN_TABLE_SCHEMA = """
     CREATE TABLE IF NOT EXISTS scrape_runs (
         id TEXT PRIMARY KEY,
         university_id TEXT NOT NULL,
@@ -16,44 +17,29 @@ SCHEMA_STATEMENTS = (
         duration_ms INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         normalized_json TEXT,
-        result_json TEXT NOT NULL,
-        logs_json TEXT NOT NULL
+        errors_json TEXT NOT NULL DEFAULT '[]',
+        logs_json TEXT NOT NULL DEFAULT '[]'
     )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS page_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id TEXT NOT NULL,
-        page_name TEXT NOT NULL,
-        page_type TEXT NOT NULL,
-        intent TEXT NOT NULL,
-        audience TEXT NOT NULL,
-        url TEXT NOT NULL,
-        fetch_mode TEXT NOT NULL,
-        status TEXT NOT NULL,
-        started_at TEXT NOT NULL,
-        finished_at TEXT NOT NULL,
-        result_json TEXT NOT NULL,
-        FOREIGN KEY (run_id) REFERENCES scrape_runs(id) ON DELETE CASCADE
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS entity_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id TEXT NOT NULL,
-        page_name TEXT NOT NULL,
-        entity_type TEXT NOT NULL,
-        record_index INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        result_json TEXT NOT NULL,
-        FOREIGN KEY (run_id) REFERENCES scrape_runs(id) ON DELETE CASCADE
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_scrape_runs_university_created ON scrape_runs (university_id, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_page_results_run_id ON page_results (run_id)",
-    "CREATE INDEX IF NOT EXISTS idx_entity_results_run_id ON entity_results (run_id)",
-)
+"""
 
+RUN_TABLE_COLUMNS = {
+    "id": "TEXT",
+    "university_id": "TEXT NOT NULL",
+    "university_name": "TEXT NOT NULL",
+    "status": "TEXT NOT NULL",
+    "started_at": "TEXT NOT NULL",
+    "finished_at": "TEXT NOT NULL",
+    "duration_ms": "INTEGER NOT NULL",
+    "created_at": "TEXT NOT NULL",
+    "normalized_json": "TEXT",
+    "errors_json": "TEXT NOT NULL DEFAULT '[]'",
+    "logs_json": "TEXT NOT NULL DEFAULT '[]'",
+}
+
+SCHEMA_STATEMENTS = (
+    RUN_TABLE_SCHEMA,
+    "CREATE INDEX IF NOT EXISTS idx_scrape_runs_university_created ON scrape_runs (university_id, created_at DESC)",
+)
 
 class SQLiteDatabase:
     def __init__(self, path: str | Path) -> None:
@@ -68,6 +54,34 @@ class SQLiteDatabase:
 
     def initialize(self) -> None:
         with self.connect() as connection:
-            for statement in SCHEMA_STATEMENTS:
-                connection.execute(statement)
+            self._migrate(connection)
             connection.commit()
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        current_version = self._schema_version(connection)
+
+        for statement in SCHEMA_STATEMENTS:
+            connection.execute(statement)
+
+        if current_version < 2:
+            self._ensure_run_columns(connection)
+
+        connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+
+    def _schema_version(self, connection: sqlite3.Connection) -> int:
+        row = connection.execute("PRAGMA user_version").fetchone()
+        if row is None:
+            return 0
+        return int(row[0])
+
+    def _ensure_run_columns(self, connection: sqlite3.Connection) -> None:
+        existing_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(scrape_runs)")
+        }
+        for column_name, column_type in RUN_TABLE_COLUMNS.items():
+            if column_name in existing_columns:
+                continue
+            connection.execute(
+                f"ALTER TABLE scrape_runs ADD COLUMN {column_name} {column_type}"
+            )
