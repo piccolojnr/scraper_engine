@@ -31,6 +31,12 @@ class RunNormalizer(Protocol):
 
 
 @dataclass(slots=True)
+class UniversityRunExecution:
+    result: UniversityRunResult
+    context: UniversityRuntimeContext
+
+
+@dataclass(slots=True)
 class UniversityRunner:
     """
     Executes all enabled pages for one university config, then optionally
@@ -41,6 +47,13 @@ class UniversityRunner:
     normalizer: RunNormalizer | None = None
 
     async def run(self, config: UniversityScraperConfig) -> UniversityRunResult:
+        execution = await self.run_with_context(config)
+        return execution.result
+
+    async def run_with_context(
+        self,
+        config: UniversityScraperConfig,
+    ) -> UniversityRunExecution:
         context = UniversityRuntimeContext(university=config)
         context.log(f"Starting university run for '{config.profile.id}'.")
 
@@ -111,7 +124,7 @@ class UniversityRunner:
             errors=page_errors,
         )
         context.set_run_result(final_result)
-        return final_result
+        return UniversityRunExecution(result=final_result, context=context)
 
     def _derive_run_status(self, page_results: list) -> RunStatus:
         if not page_results:

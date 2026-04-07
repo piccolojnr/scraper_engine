@@ -5,15 +5,18 @@ import asyncio
 import json
 from pathlib import Path
 
-from app.config.registry import ConfigNotFoundError, registry
+from app.config.registry import ConfigNotFoundError
 from app.extractors.factory import ExtractorFactory
 from app.normalizers.orchestrator import EntityRunNormalizer
+from app.persistence.db import SQLiteDatabase
+from app.persistence.repositories import RunRepository
 from app.runner.page_runner import PageRunner
 from app.runner.university_runner import UniversityRunner
 from app.runtime.browser_client import PlaywrightBrowserClient
 from app.runtime.http_client import SimpleHttpClient
 from app.runtime.openai_llm_client import OpenAILLMClient
 from app.schemas.results import UniversityRunResult
+from app.services.scrape_service import ScrapeExecution, ScrapeService
 from app.settings import get_settings
 
 
@@ -64,11 +67,7 @@ async def run_once(
     configs_dir: str,
     headed: bool,
     browser: str,
-) -> UniversityRunResult:
-    registry.clear()
-    registry.load_package(configs_package, Path(configs_dir))
-    config = registry.get(config_id)
-
+) -> ScrapeExecution:
     settings = get_settings()
     llm_client = OpenAILLMClient.from_env()
 
@@ -95,7 +94,23 @@ async def run_once(
             normalizer=EntityRunNormalizer(),
         )
 
-        return await university_runner.run(config)
+        run_repository = None
+        if settings.persistence.enabled:
+            run_repository = RunRepository(
+                SQLiteDatabase(Path(settings.persistence.sqlite_path))
+            )
+            run_repository.initialize()
+
+        service = ScrapeService(
+            university_runner=university_runner,
+            run_repository=run_repository,
+        )
+
+        return await service.run(
+            config_id=config_id,
+            configs_package=configs_package,
+            configs_dir=configs_dir,
+        )
 
 
 def print_summary(result: UniversityRunResult) -> None:
@@ -180,7 +195,7 @@ async def async_main() -> int:
     args = parser.parse_args()
 
     try:
-        result = await run_once(
+        execution = await run_once(
             config_id=args.config_id,
             configs_package=args.configs_package,
             configs_dir=args.configs_dir,
@@ -194,12 +209,22 @@ async def async_main() -> int:
         print(f"Run failed: {exc}")
         return 1
 
+    result = execution.result
+
     print_summary(result)
 
     if args.output_json:
         write_json(result, args.output_json)
         print()
         print(f"Saved JSON result to: {args.output_json}")
+
+    if execution.persisted_run is not None:
+        print()
+        print(
+            "Persisted run:"
+            f" {execution.persisted_run.run_id}"
+            f" ({get_settings().persistence.sqlite_path})"
+        )
 
     return 0
 

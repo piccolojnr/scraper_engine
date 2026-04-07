@@ -21,11 +21,19 @@ class HttpClientSettings(BaseSettings):
     verify_ssl: bool = True
 
 
+class PersistenceSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="PERSISTENCE_", extra="ignore")
+
+    enabled: bool = True
+    sqlite_path: str = "outputs/scraper_engine.sqlite3"
+
+
 class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
 
     openai: OpenAISettings = OpenAISettings()
     http_client: HttpClientSettings = HttpClientSettings()
+    persistence: PersistenceSettings = PersistenceSettings()
 
 
 @lru_cache(maxsize=1)
