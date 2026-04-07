@@ -18,7 +18,7 @@ from app.config.models import (
 )
 
 CONFIG = UniversityConfig(
-    id="unilag",
+    id="un",
     university_name="University of Lagos",
     country="Nigeria",
     pages=[

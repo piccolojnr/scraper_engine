@@ -5,13 +5,17 @@ from typing import Literal, Optional
 
 from playwright.async_api import (
     Browser,
+    BrowserContext,
     Page,
     Playwright,
     async_playwright,
 )
+from pydantic import HttpUrl, TypeAdapter
 
 from app.extractors.utils import document_text, parse_html
 from app.runner.page_runner import BrowserPageHandle, FetchResponse
+
+HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
 
 
 @dataclass(slots=True)
@@ -57,8 +61,16 @@ class PlaywrightPageHandle(BrowserPageHandle):
         await self.page.context.close()
 
     @property
-    def url(self) -> str:
-        return self.page.url
+    def browser_context(self) -> BrowserContext:
+        return self.page.context
+
+    @property
+    def browser(self) -> Browser:
+        return self.page.context.browser
+
+    @property
+    def url(self) -> HttpUrl:
+        return HTTP_URL_ADAPTER.validate_python(self.page.url)
 
 
 @dataclass(slots=True)
@@ -110,7 +122,7 @@ class PlaywrightBrowserClient:
     async def fetch(
         self,
         *,
-        url: str,
+        url: HttpUrl | str,
         timeout_ms: int,
         headers: dict[str, str],
         wait_for_selector: str | None = None,
@@ -135,7 +147,7 @@ class PlaywrightBrowserClient:
         page.set_default_timeout(timeout_ms)
 
         await page.goto(
-            url,
+            str(url),
             wait_until=self.default_navigation_wait_until,
             timeout=timeout_ms,
         )
@@ -150,7 +162,7 @@ class PlaywrightBrowserClient:
 
         return (
             FetchResponse(
-                url=page.url,
+                url=HTTP_URL_ADAPTER.validate_python(page.url),
                 html=html,
                 text_content=text_content,
             ),

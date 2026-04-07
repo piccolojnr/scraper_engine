@@ -71,7 +71,7 @@ from app.config.models import (
 # ``id`` is a short, unique identifier for the institution.  ``university_name``
 # provides the human‑readable name and ``country`` notes the location.
 CONFIG = UniversityConfig(
-    id="unilag",
+    id="unilag2",
     university_name="University of Lagos",
     country="Nigeria",
     pages=[

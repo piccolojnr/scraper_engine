@@ -1,31 +1,29 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
-from app.config.models import PageConfig, UniversityConfig
+from pydantic import HttpUrl
+
+from app.config.models import PageConfig, UniversityScraperConfig, EntityType
 from app.schemas.results import (
+    EntityErrorReport,
+    EntityExtractionResult,
+    EntityIdentity,
+    EntityRunStatus,
     ErrorCode,
     ExtractedFieldResult,
+    NormalizedRunOutput,
     PageErrorReport,
     PageExtractionResult,
     PageRunStatus,
+    UniversityRunResult,
 )
 
 
 @dataclass(slots=True)
 class RuntimeArtifact:
-    """
-    A file or debug artifact produced during execution.
-
-    Examples:
-      - saved HTML snapshot
-      - screenshot
-      - downloaded PDF
-      - extracted text dump
-    """
     kind: str
     path: str
     description: str | None = None
@@ -33,53 +31,127 @@ class RuntimeArtifact:
 
 @dataclass(slots=True)
 class FieldEvidence:
-    """
-    Optional evidence captured while extracting a field.
-    """
     selector_used: str | None = None
     evidence: str | None = None
     confidence: float | None = None
 
 
 @dataclass(slots=True)
+class EntityDraft:
+    """
+    Mutable in-progress entity being built during page extraction.
+    This exists only during extraction, before being frozen into EntityExtractionResult.
+    """
+
+    entity_type: EntityType
+    source_page_name: str
+    record_index: int = 0
+    source_url: HttpUrl | None = None
+
+    field_results: list[ExtractedFieldResult] = field(default_factory=list)
+    raw_text_excerpt: str | None = None
+    html_fragment: str | None = None
+    error: EntityErrorReport | None = None
+
+    def add_field_result(
+        self,
+        *,
+        field_name: str,
+        strategy: Any,
+        success: bool,
+        value: Any = None,
+        evidence: str | None = None,
+        selector_used: str | None = None,
+        confidence: float | None = None,
+        error_code: ErrorCode | None = None,
+        error_message: str | None = None,
+    ) -> ExtractedFieldResult:
+        result = ExtractedFieldResult(
+            entity_type=self.entity_type,
+            field_name=field_name,
+            strategy=strategy,
+            success=success,
+            value=value,
+            evidence=evidence,
+            selector_used=selector_used,
+            confidence=confidence,
+            error_code=error_code,
+            error_message=error_message,
+        )
+        self.field_results.append(result)
+        return result
+
+    def set_error(
+        self,
+        *,
+        error_code: ErrorCode,
+        message: str,
+        detail: str | None = None,
+        field_name: str | None = None,
+    ) -> EntityErrorReport:
+        self.error = EntityErrorReport(
+            entity_type=self.entity_type,
+            source_page_name=self.source_page_name,
+            record_index=self.record_index,
+            error_code=error_code,
+            message=message,
+            detail=detail,
+            field_name=field_name,
+        )
+        return self.error
+
+    def output_map(self) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for field in self.field_results:
+            if field.success:
+                output[field.field_name] = field.value
+        return output
+
+    def to_result(self, status: EntityRunStatus) -> EntityExtractionResult:
+        scores = [f.confidence for f in self.field_results if f.confidence is not None]
+        confidence = sum(scores) / len(scores) if scores else None
+
+        return EntityExtractionResult(
+            identity=EntityIdentity(
+                entity_type=self.entity_type,
+                source_page_name=self.source_page_name,
+                record_index=self.record_index,
+                source_url=self.source_url,
+            ),
+            status=status,
+            field_results=self.field_results,
+            raw_text_excerpt=self.raw_text_excerpt,
+            html_fragment=self.html_fragment,
+            confidence=confidence,
+            error=self.error,
+        )
+
+
+@dataclass(slots=True)
 class PageRuntimeContext:
     """
     Mutable runtime state for one page execution.
-
-    This exists only while a single page is being processed.
-    The runner populates it, action handlers mutate it, extractors read/write it,
-    and finally it is converted into a PageExtractionResult.
     """
 
-    university: UniversityConfig
+    university: UniversityScraperConfig
     page: PageConfig
     started_at: datetime = field(default_factory=datetime.utcnow)
 
-    # Fetch/runtime outputs
-    current_url: str | None = None
+    current_url: HttpUrl | None = None
     html: str | None = None
     text_content: str | None = None
 
-    # Browser-specific handles.
-    # Keep these as Any here so context.py does not hard-depend on Playwright types.
-    browser: Any | None = None 
-    """Browser instance, if using browser-based fetching."""
+    browser: Any | None = None
     browser_context: Any | None = None
-    """Browser context (e.g. incognito), if using browser-based fetching."""
     browser_page: Any | None = None
-    """Browser page/tab, if using browser-based fetching."""
 
-    # Extraction/runtime data
-    extracted_fields: list[ExtractedFieldResult] = field(default_factory=list)
-    raw_outputs: dict[str, Any] = field(default_factory=dict)
+    entities: list[EntityExtractionResult] = field(default_factory=list)
     variables: dict[str, Any] = field(default_factory=dict)
 
-    # Diagnostics
     logs: list[str] = field(default_factory=list)
     artifacts: list[RuntimeArtifact] = field(default_factory=list)
     error: PageErrorReport | None = None
 
-    # Optional short excerpt for debug/result reporting
     raw_text_excerpt: str | None = None
 
     def log(self, message: str) -> None:
@@ -98,7 +170,7 @@ class PageRuntimeContext:
             self.raw_text_excerpt = cleaned[:1000] if cleaned else None
             self.log(f"Text content captured for page '{self.page.name}'.")
 
-    def set_current_url(self, url: str) -> None:
+    def set_current_url(self, url: HttpUrl) -> None:
         self.current_url = url
         self.log(f"Current URL set to {url}")
 
@@ -119,47 +191,30 @@ class PageRuntimeContext:
                 return artifact.path
         return None
 
-    def add_field_result(
+    def create_entity_draft(
         self,
         *,
-        name: str,
-        output_field: str,
-        strategy: Any,
-        success: bool,
-        value: Any = None,
-        evidence: str | None = None,
-        selector_used: str | None = None,
-        confidence: float | None = None,
-        error_code: ErrorCode | None = None,
-        error_message: str | None = None,
-    ) -> ExtractedFieldResult:
-        """
-        Add one extraction result and update raw_outputs on success.
-        """
-        result = ExtractedFieldResult(
-            name=name,
-            output_field=output_field,
-            strategy=strategy,
-            success=success,
-            value=value,
-            evidence=evidence,
-            selector_used=selector_used,
-            confidence=confidence,
-            error_code=error_code,
-            error_message=error_message,
+        entity_type: EntityType,
+        record_index: int = 0,
+        source_url: HttpUrl | None = None,
+    ) -> EntityDraft:
+        self.log(
+            f"Created entity draft type={entity_type} "
+            f"record_index={record_index} page={self.page.name}"
         )
-        self.extracted_fields.append(result)
+        return EntityDraft(
+            entity_type=entity_type,
+            source_page_name=self.page.name,
+            record_index=record_index,
+            source_url=source_url or self.current_url,
+        )
 
-        if success:
-            self.raw_outputs[output_field] = value
-            self.log(f"Field '{name}' extracted successfully into '{output_field}'.")
-        else:
-            self.log(
-                f"Field '{name}' failed extraction."
-                + (f" error_code={error_code}" if error_code else "")
-            )
-
-        return result
+    def add_entity_result(self, entity: EntityExtractionResult) -> None:
+        self.entities.append(entity)
+        self.log(
+            f"Entity result added type={entity.identity.entity_type} "
+            f"record_index={entity.identity.record_index}"
+        )
 
     def set_error(
         self,
@@ -171,8 +226,10 @@ class PageRuntimeContext:
     ) -> PageErrorReport:
         report = PageErrorReport(
             page_name=self.page.name,
-            page_category=self.page.category,
-            url=self.page.url,
+            page_type=self.page.type,
+            intent=self.page.intent,
+            audience=self.page.audience,
+            url=self.page.url or (self.current_url or cast(HttpUrl, "http://invalid.local")),
             fetch_mode=self.page.fetch.mode,
             error_code=error_code,
             message=message,
@@ -190,13 +247,15 @@ class PageRuntimeContext:
 
         return PageExtractionResult(
             page_name=self.page.name,
-            page_category=self.page.category,
-            url=self.page.url,
+            page_type=self.page.type,
+            intent=self.page.intent,
+            audience=self.page.audience,
+            url=self.page.url or (self.current_url or cast(HttpUrl, "http://invalid.local")),
             fetch_mode=self.page.fetch.mode,
             status=status,
             started_at=self.started_at,
             finished_at=finished_at,
-            extracted_fields=self.extracted_fields,
+            entities=self.entities,
             raw_text_excerpt=self.raw_text_excerpt,
             html_snapshot_path=self.artifact_path("html"),
             screenshot_path=self.artifact_path("screenshot"),
@@ -208,21 +267,16 @@ class PageRuntimeContext:
 class UniversityRuntimeContext:
     """
     Mutable runtime state for one full university scrape run.
-
-    This wraps all page contexts and the final normalized output.
     """
 
-    university: UniversityConfig
+    university: UniversityScraperConfig
     started_at: datetime = field(default_factory=datetime.utcnow)
 
     page_contexts: list[PageRuntimeContext] = field(default_factory=list)
     logs: list[str] = field(default_factory=list)
 
-    # Raw outputs grouped by page name after successful extraction
-    page_outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
-
-    # Final normalized snapshot populated by the normalizer layer
-    snapshot_data: dict[str, Any] = field(default_factory=dict)
+    normalized: NormalizedRunOutput | None = None
+    run_result: UniversityRunResult | None = None
 
     def log(self, message: str) -> None:
         timestamp = datetime.utcnow().isoformat()
@@ -234,19 +288,16 @@ class UniversityRuntimeContext:
         self.log(f"Created page context for '{page.name}'.")
         return ctx
 
-    def collect_page_output(self, page_ctx: PageRuntimeContext) -> None:
-        self.page_outputs[page_ctx.page.name] = dict(page_ctx.raw_outputs)
-        self.log(f"Collected raw outputs for page '{page_ctx.page.name}'.")
+    def set_normalized(self, normalized: NormalizedRunOutput) -> None:
+        self.normalized = normalized
+        self.log("Normalized run output updated.")
 
-    def set_snapshot_data(self, data: dict[str, Any]) -> None:
-        self.snapshot_data = data
-        self.log("Snapshot data updated.")
+    def set_run_result(self, result: UniversityRunResult) -> None:
+        self.run_result = result
+        self.log("Run result updated.")
 
     def get_page_context(self, page_name: str) -> PageRuntimeContext:
         for ctx in self.page_contexts:
             if ctx.page.name == page_name:
                 return ctx
         raise KeyError(f"Page context '{page_name}' not found.")
-
-    def get_page_output(self, page_name: str) -> dict[str, Any]:
-        return self.page_outputs.get(page_name, {})

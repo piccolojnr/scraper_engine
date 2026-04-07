@@ -1,13 +1,20 @@
-
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
-from app.config.models import ExtractStrategy, FetchMode, PageCategory
+from app.config.models import (
+    EntityType,
+    ExtractStrategy,
+    FetchMode,
+    PageType,
+    ContentIntent,
+    AudienceLevel,
+)
 
 
 # ============================================================
@@ -27,6 +34,12 @@ class PageRunStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+class EntityRunStatus(str, Enum):
+    SUCCESS = "success"
+    PARTIAL_SUCCESS = "partial_success"
+    FAILED = "failed"
+
+
 class ErrorCode(str, Enum):
     FETCH_FAILED = "fetch_failed"
     EMPTY_CONTENT = "empty_content"
@@ -36,8 +49,11 @@ class ErrorCode(str, Enum):
     PATTERN_NOT_MATCHED = "pattern_not_matched"
     TABLE_PARSE_FAILED = "table_parse_failed"
     LLM_EXTRACTION_FAILED = "llm_extraction_failed"
+    RECORD_LOCATOR_FAILED = "record_locator_failed"
+    ENTITY_EXTRACTION_FAILED = "entity_extraction_failed"
     EXTRACTION_FAILED = "extraction_failed"
     NORMALIZATION_FAILED = "normalization_failed"
+    VALIDATION_FAILED = "validation_failed"
     ACCESS_DENIED = "access_denied"
     STRUCTURE_CHANGED = "structure_changed"
     TIMEOUT = "timeout"
@@ -51,13 +67,18 @@ class ErrorCode(str, Enum):
 
 class ExtractedFieldResult(BaseModel):
     """
-    Result of one ExtractRule execution.
+    Result of one extraction step chain for one field.
+    Example:
+      - portal.title
+      - portal.status
+      - course.name
+      - university.website_url
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str
-    output_field: str
+    entity_type: EntityType
+    field_name: str
     strategy: ExtractStrategy
     success: bool
 
@@ -83,7 +104,9 @@ class PageErrorReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     page_name: str
-    page_category: PageCategory
+    page_type: PageType
+    intent: ContentIntent
+    audience: AudienceLevel
     url: HttpUrl
     fetch_mode: FetchMode
 
@@ -95,6 +118,78 @@ class PageErrorReport(BaseModel):
     html_snapshot_path: str | None = None
     screenshot_path: str | None = None
     happened_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ============================================================
+# ENTITY-LEVEL EXTRACTION RESULTS
+# ============================================================
+
+
+class EntityIdentity(BaseModel):
+    """
+    Minimal identity handle for one extracted record.
+    Useful before DB persistence exists.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_type: EntityType
+    source_page_name: str
+    record_index: int = Field(default=0, ge=0)
+    source_url: HttpUrl | None = None
+
+
+class EntityErrorReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entity_type: EntityType
+    source_page_name: str
+    record_index: int = Field(default=0, ge=0)
+
+    error_code: ErrorCode
+    message: str
+    detail: str | None = None
+    field_name: str | None = None
+
+
+class EntityExtractionResult(BaseModel):
+    """
+    Raw extraction result for one entity record from one page.
+
+    Example:
+      - one portal card on an admissions page
+      - one course row in a programmes table
+      - one university profile block
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    identity: EntityIdentity
+    status: EntityRunStatus
+
+    field_results: list[ExtractedFieldResult] = Field(default_factory=list)
+
+    raw_text_excerpt: str | None = None
+    html_fragment: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    error: EntityErrorReport | None = None
+
+    def field_result(self, name: str) -> ExtractedFieldResult:
+        for field in self.field_results:
+            if field.field_name == name:
+                return field
+        raise KeyError(
+            f"Field result '{name}' not found for "
+            f"{self.identity.entity_type}:{self.identity.source_page_name}:{self.identity.record_index}."
+        )
+
+    def output_map(self) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for field in self.field_results:
+            if field.success:
+                output[field.field_name] = field.value
+        return output
 
 
 # ============================================================
@@ -110,7 +205,9 @@ class PageExtractionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     page_name: str
-    page_category: PageCategory
+    page_type: PageType
+    intent: ContentIntent
+    audience: AudienceLevel
     url: HttpUrl
     fetch_mode: FetchMode
     status: PageRunStatus
@@ -118,7 +215,7 @@ class PageExtractionResult(BaseModel):
     started_at: datetime
     finished_at: datetime
 
-    extracted_fields: list[ExtractedFieldResult] = Field(default_factory=list)
+    entities: list[EntityExtractionResult] = Field(default_factory=list)
 
     raw_text_excerpt: str | None = None
     html_snapshot_path: str | None = None
@@ -135,208 +232,123 @@ class PageExtractionResult(BaseModel):
         delta = self.finished_at - self.started_at
         return int(delta.total_seconds() * 1000)
 
-    def field_result(self, name: str) -> ExtractedFieldResult:
-        for field in self.extracted_fields:
-            if field.name == name:
-                return field
-        raise KeyError(f"Field result '{name}' not found on page '{self.page_name}'.")
-
-    def output_map(self) -> dict[str, Any]:
-        """
-        Flatten successful extracted values by output_field.
-
-        If multiple rules target the same output_field, the last successful one wins.
-        Normalizers can use this as a simple raw input map.
-        """
-        output: dict[str, Any] = {}
-
-        for field in self.extracted_fields:
-            if field.success:
-                output[field.output_field] = field.value
-
-        return output
+    def entities_by_type(self, entity_type: EntityType) -> list[EntityExtractionResult]:
+        return [entity for entity in self.entities if entity.identity.entity_type == entity_type]
 
 
 # ============================================================
-# NORMALIZED DOMAIN MODELS
-# These are the structured entities you ultimately want to store.
+# NORMALIZED ENTITY RECORDS
+# These are the structured entities you persist or upsert later.
 # ============================================================
 
 
-class DeadlineEntry(BaseModel):
+class BaseNormalizedRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-    admission_type: str
-    opens: str | None = None
-    closes: str | None = None
-    opens_date: datetime | None = None
-    closes_date: datetime | None = None
-
-
-class TuitionFee(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    programme: str
-    student_type: str
-    amount: str | None = None
-    amount_numeric: float | None = None
-    currency: str | None = None
-    per: str = "semester"
-    notes: str | None = None
-
-
-class CutOffEntry(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    programme: str
-    college: str | None = None
-    first_choice_cutoff: str | None = None
-    fee_paying_cutoff: str | None = None
-    second_choice_cutoff: str | None = None
-    subject_requirements: str | None = None
-
-
-class Programme(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    degree_types: list[str] = Field(default_factory=list)
-    level: str
-    overview: str | None = None
-    department_url: str | None = None
-    duration: str | None = None
-    study_modes: list[str] = Field(default_factory=list)
-    accredited_by: str | None = None
-    tuition_fees: list[TuitionFee] = Field(default_factory=list)
-
-
-class FeeInfo(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    local_application_fee: str | None = None
-    international_application_fee: str | None = None
-    local_tuition_note: str | None = None
-    international_tuition_note: str | None = None
-    payment_banks: list[str] = Field(default_factory=list)
-    payment_account: str | None = None
-    payment_swift: str | None = None
-    ussd_code: str | None = None
-    online_payment_url: str | None = None
-
-
-class ApplyInfo(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    local_url: str | None = None
-    international_url: str | None = None
-    general_url: str | None = None
-    required_documents: list[str] = Field(default_factory=list)
-    notes: list[str] = Field(default_factory=list)
-    entry_requirements_summary: str | None = None
-    min_aggregate: str | None = None
-
-
-class OngoingAdmission(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str
-    description: str | None = None
-    status: str
-
-
-class Scholarship(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    provider: str | None = None
-    description: str | None = None
-    coverage: str | None = None
-    eligibility: list[str] = Field(default_factory=list)
-    min_gpa: str | None = None
-    target_level: str | None = None
-    target_college: str | None = None
-    deadline: str | None = None
-    deadline_date: datetime | None = None
-    apply_url: str | None = None
-    contact_email: str | None = None
-    contact_phone: str | None = None
-    renewable: bool | None = None
-    is_need_based: bool | None = None
-    is_merit_based: bool | None = None
-
-
-class AccreditationInfo(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    body: str
-    status: str
-    since: str | None = None
-    expires: str | None = None
-    scope: str = "institutional"
-    programme: str | None = None
-
-
-class UniversityProfile(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    description: str | None = None
-    type: str | None = None
-    founded: int | None = None
-    location_city: str | None = None
-    location_region: str | None = None
-    location_lat: float | None = None
-    location_lng: float | None = None
-    website: str | None = None
-    financialaid_url: str | None = None
-    scholarships_apply_url: str | None = None
-    total_students: int | None = None
-    international_students: int | None = None
-    phone: str | None = None
-    email: str | None = None
-    po_box: str | None = None
-    accreditations: list[AccreditationInfo] = Field(default_factory=list)
-    rankings: dict[str, str] = Field(default_factory=dict)
-    social_media: dict[str, str] = Field(default_factory=dict)
-
-
-# ============================================================
-# FINAL NORMALIZED SNAPSHOT
-# This is the structured university-level result produced after
-# page extraction + normalization.
-# ============================================================
-
-
-class UniversitySnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    university_id: str
-    university_name: str
-
-    status: str | None = None
-    cycle: str | None = None
-    raw_snippet: str | None = None
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
-
-    scraped_at: datetime = Field(default_factory=datetime.utcnow)
-
-    open_date: datetime | None = None
-    close_date: datetime | None = None
-
-    ongoing_admissions: list[OngoingAdmission] = Field(default_factory=list)
-    deadlines: list[DeadlineEntry] = Field(default_factory=list)
-
-    programmes: list[Programme] = Field(default_factory=list)
-    cut_off_points: list[CutOffEntry] = Field(default_factory=list)
-
-    fees: FeeInfo | None = None
-    tuition_fees: list[TuitionFee] = Field(default_factory=list)
-    scholarships: list[Scholarship] = Field(default_factory=list)
-
-    apply_info: ApplyInfo | None = None
-    profile: UniversityProfile | None = None
 
     source_urls: list[str] = Field(default_factory=list)
+    source_page_names: list[str] = Field(default_factory=list)
+    raw_snippets: list[str] = Field(default_factory=list)
+
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    extracted_at: datetime = Field(default_factory=datetime.utcnow)
     content_hash: str | None = None
+
+
+class UniversityRecord(BaseNormalizedRecord):
+    model_config = ConfigDict(extra="forbid")
+
+    external_university_id: str | None = None
+
+    name: str
+    slug_candidate: str | None = None
+    country: str
+
+    state_province: str | None = None
+    city: str | None = None
+    type: str | None = None
+
+    website_url: str | None = None
+    logo_url: str | None = None
+    description: str | None = None
+    course_catalog_url: str | None = None
+    fee_schedule_url: str | None = None
+
+    is_active: bool = True
+
+
+class PortalRecord(BaseNormalizedRecord):
+    model_config = ConfigDict(extra="forbid")
+
+    external_university_id: str | None = None
+    university_name_hint: str | None = None
+
+    title: str
+    slug_candidate: str | None = None
+    description: str | None = None
+    portal_url: str | None = None
+
+    degree_level: str | None = None
+    academic_year: str | None = None
+
+    opens_at: datetime | None = None
+    closes_at: datetime | None = None
+    next_opens_at: datetime | None = None
+
+    status: str | None = None
+
+    fee_amount: Decimal | None = None
+    fee_currency: str | None = None
+    intl_fee_amount: Decimal | None = None
+    intl_fee_currency: str | None = None
+    fee_note: str | None = None
+
+    requirements: str | None = None
+    instructions: str | None = None
+
+    is_featured: bool | None = None
+    is_premium: bool | None = None
+
+
+class CourseRecord(BaseNormalizedRecord):
+    model_config = ConfigDict(extra="forbid")
+
+    external_university_id: str | None = None
+    university_name_hint: str | None = None
+
+    name: str
+    slug_candidate: str | None = None
+
+    faculty: str | None = None
+    department: str | None = None
+
+    degree_level: str | None = None
+    mode: str | None = None
+
+    duration_years: int | None = None
+
+    tuition_fee: Decimal | None = None
+    fee_currency: str | None = None
+    fee_note: str | None = None
+
+    description: str | None = None
+    requirements: str | None = None
+    cut_off_point: str | None = None
+
+    is_active: bool = True
+
+
+# ============================================================
+# NORMALIZED RUN OUTPUT
+# This replaces the old UniversitySnapshot.
+# ============================================================
+
+
+class NormalizedRunOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    university: UniversityRecord | None = None
+    portals: list[PortalRecord] = Field(default_factory=list)
+    courses: list[CourseRecord] = Field(default_factory=list)
 
 
 # ============================================================
@@ -356,7 +368,7 @@ class UniversityRunResult(BaseModel):
     finished_at: datetime
 
     page_results: list[PageExtractionResult] = Field(default_factory=list)
-    snapshot: UniversitySnapshot | None = None
+    normalized: NormalizedRunOutput | None = None
     errors: list[PageErrorReport] = Field(default_factory=list)
 
     @property
@@ -378,17 +390,8 @@ class UniversityRunResult(BaseModel):
                 return page
         raise KeyError(f"Page result '{name}' not found for university '{self.university_id}'.")
 
-    def page_output_map(self) -> dict[str, dict[str, Any]]:
-        """
-        Return raw extracted outputs grouped by page name.
-
-        Example:
-            {
-                "main_portal": {"portal_status": "open", "portal_notice_text": "..."},
-                "fees_page": {"fees_raw": [...]},
-            }
-        """
-        return {
-            page.page_name: page.output_map()
-            for page in self.page_results
-        }
+    def entity_results(self, entity_type: EntityType) -> list[EntityExtractionResult]:
+        output: list[EntityExtractionResult] = []
+        for page in self.page_results:
+            output.extend(page.entities_by_type(entity_type))
+        return output

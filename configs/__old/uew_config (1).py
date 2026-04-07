@@ -87,7 +87,7 @@ from app.config.models import (
 # ``id`` is a short, unique identifier for the institution.  The
 # ``country`` field assists in grouping universities by region.
 CONFIG = UniversityConfig(
-    id="uew",
+    id="uew2",
     university_name="University of Education, Winneba",
     country="Ghana",
     pages=[

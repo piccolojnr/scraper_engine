@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from app.config.models import ExtractRule, ExtractStrategy
-from app.extractors.base import BaseExtractor, ExtractionResult
+from app.config.models import ExtractStrategy
+from app.extractors.base import BaseStepExtractor, ExtractionResult, StepExtractionRequest
 from app.extractors.utils import (
     all_matching_selectors,
     document_text,
@@ -13,66 +13,50 @@ from app.extractors.utils import (
 from app.runtime.context import PageRuntimeContext
 
 
-class PatternExtractor(BaseExtractor):
+class PatternExtractor(BaseStepExtractor):
     """
     Extract a labeled value by matching configured regex/text patterns against
     text resolved from one or more selectors.
-
-    Typical use cases:
-      - classify status with more flexible patterns
-      - detect application cycle phrases
-      - match variable text structures where exact keyword matching is too rigid
-
-    Behavior:
-      - tries selector-scoped content first
-      - if no selector block matches, falls back to whole-document text
-      - returns the configured label as the extracted value
     """
 
     name = "pattern"
-    version = "1"
+    version = "2"
 
-    def validate_rule(self, rule: ExtractRule) -> None:
-        if rule.strategy != ExtractStrategy.PATTERN:
-            raise ValueError(
-                f"{self.__class__.__name__} only supports strategy='pattern'."
+    async def extract_entity_field(
+        self,
+        *,
+        context: PageRuntimeContext,
+        request: StepExtractionRequest,
+    ) -> ExtractionResult:
+        step = request.step
+        if step.strategy != ExtractStrategy.PATTERN:
+            return self.make_failure_result(
+                error_message="PatternExtractor only supports pattern steps."
             )
 
-        if rule.pattern_config is None:
-            raise ValueError("pattern_config is required for pattern extraction.")
+        if step.pattern_config is None:
+            return self.make_failure_result(
+                error_message="pattern_config is required for pattern extraction."
+            )
 
-        if not rule.pattern_config.selectors:
-            raise ValueError("pattern_config.selectors must not be empty.")
+        scoped_context = self.scoped_context(
+            context=context,
+            record_scope=request.record_scope,
+        )
 
-        if not rule.pattern_config.labels:
-            raise ValueError("pattern_config.labels must not be empty.")
-
-        if rule.many:
-            raise ValueError("pattern extraction does not support many=True.")
-
-    async def extract(
-        self,
-        context: PageRuntimeContext,
-        rule: ExtractRule,
-    ) -> ExtractionResult:
-        self.validate_rule(rule)
-
-        if not context.html:
+        if not scoped_context.html:
             return self.make_failure_result(
                 error_message="No HTML content available in page context."
             )
 
-        pattern_config = rule.pattern_config
-        assert pattern_config is not None  # typing
-
-        soup = parse_html(context.html)
+        pattern_config = step.pattern_config
+        soup = parse_html(scoped_context.html)
 
         labels = [
             (group.label, group.patterns)
             for group in pattern_config.labels
         ]
 
-        # 1. Prefer selector-scoped blocks first
         selected_blocks = all_matching_selectors(soup, pattern_config.selectors)
 
         for block in selected_blocks:
@@ -90,7 +74,8 @@ class PatternExtractor(BaseExtractor):
                 selector_used=block.selector,
             )
             metadata = self.build_metadata(
-                rule=rule,
+                field_name=request.field_name,
+                step=step,
                 extraction_input=extraction_input,
             )
 
@@ -108,7 +93,6 @@ class PatternExtractor(BaseExtractor):
                 metadata=metadata,
             )
 
-        # 2. Fall back to whole-document text
         full_text = document_text(soup)
         label, matched_pattern = first_matching_pattern_label(
             full_text,
@@ -121,7 +105,8 @@ class PatternExtractor(BaseExtractor):
             selector_used=None,
         )
         metadata = self.build_metadata(
-            rule=rule,
+            field_name=request.field_name,
+            step=step,
             extraction_input=extraction_input,
         )
 

@@ -4,29 +4,29 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from app.config.models import FetchMode, PageCategory, UniversityConfig
+from app.config.models import FetchMode, PageType, UniversityScraperConfig, ContentIntent, AudienceLevel
 from app.runner.page_runner import PageRunner
 from app.runtime.context import UniversityRuntimeContext
 from app.schemas.results import (
     ErrorCode,
+    NormalizedRunOutput,
     PageErrorReport,
     PageRunStatus,
     RunStatus,
     UniversityRunResult,
-    UniversitySnapshot,
 )
 
 
 @runtime_checkable
-class UniversityNormalizer(Protocol):
+class RunNormalizer(Protocol):
     """
-    Converts raw page outputs + page results into a final normalized snapshot.
+    Converts raw page entity results into final normalized records.
     """
 
     async def normalize(
         self,
         context: UniversityRuntimeContext,
-    ) -> UniversitySnapshot:
+    ) -> NormalizedRunOutput:
         ...
 
 
@@ -34,15 +34,15 @@ class UniversityNormalizer(Protocol):
 class UniversityRunner:
     """
     Executes all enabled pages for one university config, then optionally
-    normalizes the combined outputs into a final UniversitySnapshot.
+    normalizes extracted entities into final normalized output.
     """
 
     page_runner: PageRunner
-    normalizer: UniversityNormalizer | None = None
+    normalizer: RunNormalizer | None = None
 
-    async def run(self, config: UniversityConfig) -> UniversityRunResult:
+    async def run(self, config: UniversityScraperConfig) -> UniversityRunResult:
         context = UniversityRuntimeContext(university=config)
-        context.log(f"Starting university run for '{config.id}'.")
+        context.log(f"Starting university run for '{config.profile.id}'.")
 
         page_results = []
         page_errors: list[PageErrorReport] = []
@@ -52,49 +52,66 @@ class UniversityRunner:
             page_result = await self.page_runner.run(page_context)
             page_results.append(page_result)
 
-            context.collect_page_output(page_context)
-
             if page_result.error is not None:
                 page_errors.append(page_result.error)
 
         run_status = self._derive_run_status(page_results)
-        snapshot: UniversitySnapshot | None = None
+        normalized: NormalizedRunOutput | None = None
+
+        provisional_result = UniversityRunResult(
+            university_id=config.profile.id,
+            university_name=config.profile.university_name,
+            status=run_status,
+            started_at=context.started_at,
+            finished_at=datetime.utcnow(),
+            page_results=page_results,
+            normalized=None,
+            errors=page_errors,
+        )
+        context.set_run_result(provisional_result)
 
         if self.normalizer is not None:
             try:
-                snapshot = await self.normalizer.normalize(context)
-                context.set_snapshot_data(snapshot.model_dump())
+                normalized = await self.normalizer.normalize(context)
+                context.set_normalized(normalized)
             except Exception as exc:
                 context.log(f"Normalization failed: {exc}")
 
                 page_errors.append(
                     PageErrorReport(
                         page_name="__normalization__",
-                        page_category=PageCategory.GENERAL,
-                        url="https://invalid.local/normalization",  # type: ignore
+                        page_type=PageType.UNKNOWN,
+                        intent=ContentIntent.GENERAL,
+                        audience=AudienceLevel.GENERAL,
+                        url="https://invalid.local/normalization",  # type: ignore[arg-type]
                         fetch_mode=FetchMode.HTTP,
                         error_code=ErrorCode.NORMALIZATION_FAILED,
-                        message="University normalization failed.",
+                        message="Run normalization failed.",
                         detail=str(exc),
-                        suggestion="Inspect page outputs and normalizer logic.",
+                        suggestion="Inspect entity results and normalizer logic.",
                     )
                 )
 
-                run_status = RunStatus.FAILED if run_status == RunStatus.SUCCESS else run_status
+                if run_status == RunStatus.SUCCESS:
+                    run_status = RunStatus.PARTIAL_SUCCESS
 
         finished_at = datetime.utcnow()
-        context.log(f"Finished university run for '{config.id}' with status={run_status.value}.")
+        context.log(
+            f"Finished university run for '{config.profile.id}' with status={run_status.value}."
+        )
 
-        return UniversityRunResult(
-            university_id=config.id,
-            university_name=config.university_name,
+        final_result = UniversityRunResult(
+            university_id=config.profile.id,
+            university_name=config.profile.university_name,
             status=run_status,
             started_at=context.started_at,
             finished_at=finished_at,
             page_results=page_results,
-            snapshot=snapshot,
+            normalized=normalized,
             errors=page_errors,
         )
+        context.set_run_result(final_result)
+        return final_result
 
     def _derive_run_status(self, page_results: list) -> RunStatus:
         if not page_results:

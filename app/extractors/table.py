@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.config.models import ExtractRule, ExtractStrategy
-from app.extractors.base import BaseExtractor, ExtractionResult
+from app.config.models import ExtractStrategy
+from app.extractors.base import BaseStepExtractor, ExtractionResult, StepExtractionRequest
 from app.extractors.utils import (
     extract_tables,
     parse_html,
@@ -12,63 +12,52 @@ from app.extractors.utils import (
 from app.runtime.context import PageRuntimeContext
 
 
-class TableExtractor(BaseExtractor):
+class TableExtractor(BaseStepExtractor):
     """
     Extract raw tabular data from HTML tables.
 
-    This extractor is intentionally generic. It returns table payloads in a
-    simple structured form and leaves domain interpretation to normalizers.
-
     Returned value shape:
-        - if rule.many is False:
-            {
-                "selector_used": str | None,
-                "header_row_index": int,
-                "rows": list[list[str]],
-            }
+        {
+            "selector_used": str | None,
+            "header_row_index": int,
+            "rows": list[list[str]],
+        }
 
-        - if rule.many is True:
-            [
-                {
-                    "selector_used": str | None,
-                    "header_row_index": int,
-                    "rows": list[list[str]],
-                },
-                ...
-            ]
+    If multiple tables are matched, returns a list of payloads.
     """
 
     name = "table"
-    version = "1"
+    version = "2"
 
-    def validate_rule(self, rule: ExtractRule) -> None:
-        if rule.strategy != ExtractStrategy.TABLE:
-            raise ValueError(
-                f"{self.__class__.__name__} only supports strategy='table'."
+    async def extract_entity_field(
+        self,
+        *,
+        context: PageRuntimeContext,
+        request: StepExtractionRequest,
+    ) -> ExtractionResult:
+        step = request.step
+        if step.strategy != ExtractStrategy.TABLE:
+            return self.make_failure_result(
+                error_message="TableExtractor only supports table steps."
             )
 
-        if rule.table_config is None:
-            raise ValueError("table_config is required for table extraction.")
+        if step.table_config is None:
+            return self.make_failure_result(
+                error_message="table_config is required for table extraction."
+            )
 
-        if not rule.table_config.selectors:
-            raise ValueError("table_config.selectors must not be empty.")
+        scoped_context = self.scoped_context(
+            context=context,
+            record_scope=request.record_scope,
+        )
 
-    async def extract(
-        self,
-        context: PageRuntimeContext,
-        rule: ExtractRule,
-    ) -> ExtractionResult:
-        self.validate_rule(rule)
-
-        if not context.html:
+        if not scoped_context.html:
             return self.make_failure_result(
                 error_message="No HTML content available in page context."
             )
 
-        table_config = rule.table_config
-        assert table_config is not None  # typing
-
-        soup = parse_html(context.html)
+        table_config = step.table_config
+        soup = parse_html(scoped_context.html)
 
         tables, selector_used = extract_tables(
             soup,
@@ -77,18 +66,17 @@ class TableExtractor(BaseExtractor):
 
         if not tables:
             extraction_input = self.build_input(
-                content=context.text_content or context.html,
+                content=scoped_context.text_content or scoped_context.html,
                 selector_used=None,
             )
             metadata = self.build_metadata(
-                rule=rule,
+                field_name=request.field_name,
+                step=step,
                 extraction_input=extraction_input,
             )
 
             return self.make_failure_result(
-                error_message=(
-                    f"No tables matched selectors {table_config.selectors}."
-                ),
+                error_message=f"No tables matched selectors {table_config.selectors}.",
                 metadata=metadata,
             )
 
@@ -118,7 +106,8 @@ class TableExtractor(BaseExtractor):
                 selector_used=selector_used,
             )
             metadata = self.build_metadata(
-                rule=rule,
+                field_name=request.field_name,
+                step=step,
                 extraction_input=extraction_input,
             )
 
@@ -128,45 +117,47 @@ class TableExtractor(BaseExtractor):
                 metadata=metadata,
             )
 
-        if rule.many:
-            combined_content = "\n\n".join(
-                "\n".join(" | ".join(row) for row in payload["rows"])
-                for payload in payloads
-            )
+        if len(payloads) == 1:
+            first_payload = payloads[0]
+            content = "\n".join(" | ".join(row) for row in first_payload["rows"])
             extraction_input = self.build_input(
-                content=combined_content,
+                content=content,
                 selector_used=selector_used,
             )
             metadata = self.build_metadata(
-                rule=rule,
+                field_name=request.field_name,
+                step=step,
                 extraction_input=extraction_input,
             )
 
-            evidence = self._build_many_evidence(payloads)
+            evidence = self._build_single_evidence(first_payload)
 
             return self.make_success_result(
-                value=payloads,
+                value=first_payload,
                 evidence=evidence,
                 selector_used=selector_used,
                 confidence=1.0,
                 metadata=metadata,
             )
 
-        first_payload = payloads[0]
-        content = "\n".join(" | ".join(row) for row in first_payload["rows"])
+        combined_content = "\n\n".join(
+            "\n".join(" | ".join(row) for row in payload["rows"])
+            for payload in payloads
+        )
         extraction_input = self.build_input(
-            content=content,
+            content=combined_content,
             selector_used=selector_used,
         )
         metadata = self.build_metadata(
-            rule=rule,
+            field_name=request.field_name,
+            step=step,
             extraction_input=extraction_input,
         )
 
-        evidence = self._build_single_evidence(first_payload)
+        evidence = self._build_many_evidence(payloads)
 
         return self.make_success_result(
-            value=first_payload,
+            value=payloads,
             evidence=evidence,
             selector_used=selector_used,
             confidence=1.0,

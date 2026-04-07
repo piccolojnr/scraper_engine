@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import httpx
+from pydantic import HttpUrl, TypeAdapter
 
 from app.extractors.utils import document_text, parse_html
 from app.runner.page_runner import FetchResponse
+
+HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
 
 
 @dataclass(slots=True)
@@ -59,7 +62,7 @@ class SimpleHttpClient:
     async def fetch(
         self,
         *,
-        url: str,
+        url: HttpUrl | str,
         timeout_ms: int,
         headers: dict[str, str],
     ) -> FetchResponse:
@@ -77,7 +80,7 @@ class SimpleHttpClient:
         timeout = httpx.Timeout(timeout_ms / 1000)
 
         response = await client.get(
-            url,
+            str(url),
             headers=merged_headers,
             timeout=timeout,
         )
@@ -87,7 +90,7 @@ class SimpleHttpClient:
         text_content = self._extract_text_content(html)
 
         return FetchResponse(
-            url=str(response.url),
+            url=HTTP_URL_ADAPTER.validate_python(str(response.url)),
             html=html,
             text_content=text_content,
         )

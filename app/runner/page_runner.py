@@ -1,25 +1,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+
+from pydantic import HttpUrl
 
 from app.config.models import (
     ClickAction,
-    ExtractRule,
+    DismissCookieBannerAction,
+    EntityExtractionPlan,
+    EntityFieldPlan,
+    ExtractionStep,
     FetchMode,
     PageAction,
     PageConfig,
+    RecordMatchStrategy,
     SelectOptionAction,
     TypeAction,
     WaitForAction,
 )
+from app.extractors.base import RecordScope, StepExtractionRequest
 from app.extractors.factory import (
     ExtractorFactory,
     MissingExtractorDependencyError,
     UnsupportedExtractorStrategyError,
 )
-from app.runtime.context import PageRuntimeContext
-from app.schemas.results import ErrorCode, PageExtractionResult, PageRunStatus
+from app.runtime.context import EntityDraft, PageRuntimeContext
+from app.schemas.results import (
+    EntityRunStatus,
+    ErrorCode,
+    PageExtractionResult,
+    PageRunStatus,
+)
 
 
 # ============================================================
@@ -29,7 +41,7 @@ from app.schemas.results import ErrorCode, PageExtractionResult, PageRunStatus
 
 @dataclass(slots=True, frozen=True)
 class FetchResponse:
-    url: str
+    url: HttpUrl
     html: str
     text_content: str | None = None
 
@@ -39,7 +51,7 @@ class HttpClient(Protocol):
     async def fetch(
         self,
         *,
-        url: str,
+        url: HttpUrl | str,
         timeout_ms: int,
         headers: dict[str, str],
     ) -> FetchResponse:
@@ -57,7 +69,7 @@ class BrowserPageHandle(Protocol):
     async def text_content(self) -> str | None: ...
     async def close(self) -> None: ...
     @property
-    def url(self) -> str: ...
+    def url(self) -> HttpUrl: ...
 
 
 @runtime_checkable
@@ -65,12 +77,17 @@ class BrowserClient(Protocol):
     async def fetch(
         self,
         *,
-        url: str,
+        url: HttpUrl | str,
         timeout_ms: int,
         headers: dict[str, str],
         wait_for_selector: str | None = None,
     ) -> tuple[FetchResponse, BrowserPageHandle]:
         ...
+
+
+
+
+
 
 
 # ============================================================
@@ -85,15 +102,9 @@ class PageRunner:
     Responsibilities:
       - fetch page content
       - run optional page actions
-      - run extractors for each rule
+      - run entity extractors
       - record success/failure into the page context
       - return final PageExtractionResult
-
-    Non-responsibilities:
-      - university-level orchestration
-      - normalization across pages
-      - persistence
-      - cache orchestration
     """
 
     def __init__(
@@ -118,7 +129,7 @@ class PageRunner:
                 await self._run_actions(context, page.actions)
                 await self._refresh_browser_content(context)
 
-            await self._run_extract_rules(context, page.extract)
+            await self._run_entity_extractors(context, page.entity_extractors)
 
             status = self._derive_page_status(context)
             context.log(f"Finished page run for '{page.name}' with status={status.value}.")
@@ -157,11 +168,12 @@ class PageRunner:
         if self.http_client is None:
             raise RuntimeError("HTTP fetch requested, but no http_client is configured.")
 
-        context.log(f"Fetching page over HTTP: {page.url}")
+        target_url = page.url or page.url_candidates[0]
+        context.log(f"Fetching page over HTTP: {target_url}")
 
         try:
             response = await self.http_client.fetch(
-                url=str(page.url),
+                url=target_url,
                 timeout_ms=page.fetch.timeout_ms,
                 headers=page.fetch.headers,
             )
@@ -180,14 +192,17 @@ class PageRunner:
         if self.browser_client is None:
             raise RuntimeError("Browser fetch requested, but no browser_client is configured.")
 
-        context.log(f"Fetching page in browser: {page.url}")
+        target_url = str(page.url or page.url_candidates[0])
+        wait_for_selector = page.fetch.browser.wait_for_selector if page.fetch.browser else None
+
+        context.log(f"Fetching page in browser: {target_url}")
 
         try:
             response, browser_page = await self.browser_client.fetch(
-                url=str(page.url),
+                url=target_url,
                 timeout_ms=page.fetch.timeout_ms,
                 headers=page.fetch.headers,
-                wait_for_selector=page.fetch.wait_for_selector,
+                wait_for_selector=wait_for_selector,
             )
         except Exception as exc:
             context.set_error(
@@ -251,7 +266,18 @@ class PageRunner:
         action: PageAction,
     ) -> None:
         browser_page = context.browser_page
-        assert browser_page is not None  # guarded earlier
+        assert browser_page is not None
+
+        if isinstance(action, DismissCookieBannerAction):
+            for selector in action.selectors:
+                try:
+                    context.log(f"Attempting cookie dismissal via selector: {selector}")
+                    await browser_page.click(selector)
+                    return
+                except Exception:
+                    continue
+            # text-based dismissal can be added later
+            return
 
         if isinstance(action, ClickAction):
             if action.selector:
@@ -296,9 +322,6 @@ class PageRunner:
         raise ValueError(f"Unsupported action type: {action.type}")
 
     async def _refresh_browser_content(self, context: PageRuntimeContext) -> None:
-        """
-        Refresh HTML/text after browser actions mutate the DOM.
-        """
         if context.browser_page is None:
             return
 
@@ -312,127 +335,250 @@ class PageRunner:
         context.set_text_content(text_content)
 
     # ========================================================
-    # EXTRACTION
+    # ENTITY EXTRACTION
     # ========================================================
 
-    async def _run_extract_rules(
+    async def _run_entity_extractors(
         self,
         context: PageRuntimeContext,
-        rules: list[ExtractRule],
+        entity_extractors: list[EntityExtractionPlan],
     ) -> None:
-        if not rules:
-            context.log("No extract rules configured for page.")
+        if not entity_extractors:
+            context.log("No entity extractors configured for page.")
             return
 
-        context.log(f"Running {len(rules)} extract rule(s).")
+        context.log(f"Running {len(entity_extractors)} entity extractor(s).")
 
-        for rule in rules:
-            await self._run_single_extract_rule(context, rule)
+        for extractor_plan in entity_extractors:
+            if not extractor_plan.enabled:
+                context.log(f"Skipping disabled entity extractor '{extractor_plan.name}'.")
+                continue
 
-    async def _run_single_extract_rule(
+            await self._run_entity_extractor(context, extractor_plan)
+
+    async def _run_entity_extractor(
         self,
         context: PageRuntimeContext,
-        rule: ExtractRule,
+        plan: EntityExtractionPlan,
     ) -> None:
         context.log(
-            f"Running extract rule '{rule.name}' "
-            f"(strategy={rule.strategy.value}, output_field={rule.output_field})."
+            f"Running entity extractor '{plan.name}' for entity_type={plan.entity_type.value}."
         )
 
+        record_scopes = await self._locate_records(context, plan)
+
+        if not record_scopes:
+            context.log(f"No records located for entity extractor '{plan.name}'.")
+            return
+
+        for scope in record_scopes:
+            draft = context.create_entity_draft(
+                entity_type=plan.entity_type,
+                record_index=scope.record_index,
+                source_url=context.current_url,
+            )
+            draft.raw_text_excerpt = scope.text_fragment
+            draft.html_fragment = scope.html_fragment
+
+            await self._run_entity_fields(context, draft, plan.fields, scope)
+
+            status = self._derive_entity_status(draft, plan.required_identity_fields)
+            context.add_entity_result(draft.to_result(status))
+
+    async def _locate_records(
+        self,
+        context: PageRuntimeContext,
+        plan: EntityExtractionPlan,
+    ) -> list[RecordScope]:
+        locator = plan.record_locator
+
+        if locator.strategy == RecordMatchStrategy.SINGLE_RECORD:
+            return [
+                RecordScope(
+                    record_index=0,
+                    html_fragment=context.html,
+                    text_fragment=context.raw_text_excerpt,
+                )
+            ]
+
+        if locator.strategy == RecordMatchStrategy.SELECTOR_GROUP:
+            # Placeholder for now.
+            # In production, parse context.html and extract one fragment per matched container.
+            # The important thing is the contract shape.
+            context.log(
+                f"Record locator selector_group using selectors={locator.container_selectors}"
+            )
+            return [
+                RecordScope(
+                    record_index=0,
+                    html_fragment=context.html,
+                    text_fragment=context.raw_text_excerpt,
+                    metadata={"container_selectors": locator.container_selectors},
+                )
+            ]
+
+        if locator.strategy == RecordMatchStrategy.TABLE_ROWS:
+            context.log(
+                f"Record locator table_rows using selectors={locator.table_selectors}"
+            )
+            return [
+                RecordScope(
+                    record_index=0,
+                    html_fragment=context.html,
+                    text_fragment=context.raw_text_excerpt,
+                    metadata={"table_selectors": locator.table_selectors},
+                )
+            ]
+
+        if locator.strategy == RecordMatchStrategy.LLM_RECORDS:
+            context.log("Record locator llm_records selected.")
+            return [
+                RecordScope(
+                    record_index=0,
+                    html_fragment=context.html,
+                    text_fragment=context.raw_text_excerpt,
+                )
+            ]
+
+        if locator.strategy == RecordMatchStrategy.POSITION:
+            return [
+                RecordScope(
+                    record_index=0,
+                    html_fragment=context.html,
+                    text_fragment=context.raw_text_excerpt,
+                )
+            ]
+
+        context.log(f"Unsupported record locator strategy: {locator.strategy}")
+        return []
+
+    async def _run_entity_fields(
+        self,
+        context: PageRuntimeContext,
+        draft: EntityDraft,
+        fields: list[EntityFieldPlan],
+        scope: RecordScope,
+    ) -> None:
+        for field_plan in fields:
+            await self._run_single_field_plan(context, draft, field_plan, scope)
+
+    async def _run_single_field_plan(
+        self,
+        context: PageRuntimeContext,
+        draft: EntityDraft,
+        field_plan: EntityFieldPlan,
+        scope: RecordScope,
+    ) -> None:
+        context.log(
+            f"Running field plan '{field_plan.field_name}' "
+            f"for entity_type={draft.entity_type.value} record_index={draft.record_index}."
+        )
+
+        last_error: str | None = None
+
+        for step in field_plan.steps:
+            try:
+                success = await self._run_extraction_step(context, draft, field_plan, step, scope)
+            except Exception as exc:
+                last_error = str(exc)
+                draft.add_field_result(
+                    field_name=field_plan.field_name,
+                    strategy=step.strategy,
+                    success=False,
+                    error_code=self._error_code_for_strategy(step.strategy),
+                    error_message=last_error,
+                )
+                continue
+
+            if success and step.stop_on_success:
+                return
+
+        if field_plan.required and field_plan.field_name not in draft.output_map():
+            draft.set_error(
+                error_code=ErrorCode.ENTITY_EXTRACTION_FAILED,
+                message=f"Required field '{field_plan.field_name}' missing.",
+                detail=last_error,
+                field_name=field_plan.field_name,
+            )
+
+    async def _run_extraction_step(
+        self,
+        context: PageRuntimeContext,
+        draft: EntityDraft,
+        field_plan: EntityFieldPlan,
+        step: ExtractionStep,
+        scope: RecordScope,
+    ) -> bool:
         try:
-            extractor = self.extractor_factory.get(rule.strategy)
-        except MissingExtractorDependencyError as exc:
-            context.add_field_result(
-                name=rule.name,
-                output_field=rule.output_field,
-                strategy=rule.strategy,
+            extractor = self.extractor_factory.get(step.strategy)
+        except (MissingExtractorDependencyError, UnsupportedExtractorStrategyError) as exc:
+            draft.add_field_result(
+                field_name=field_plan.field_name,
+                strategy=step.strategy,
                 success=False,
                 error_code=ErrorCode.EXTRACTION_FAILED,
                 error_message=str(exc),
             )
+            return False
 
-            if rule.required and context.error is None:
-                context.set_error(
-                    error_code=ErrorCode.EXTRACTION_FAILED,
-                    message=f"Required extractor dependency missing for rule '{rule.name}'.",
-                    detail=str(exc),
-                )
-            return
-
-        except UnsupportedExtractorStrategyError as exc:
-            context.add_field_result(
-                name=rule.name,
-                output_field=rule.output_field,
-                strategy=rule.strategy,
-                success=False,
-                error_code=ErrorCode.EXTRACTION_FAILED,
-                error_message=str(exc),
-            )
-
-            if rule.required and context.error is None:
-                context.set_error(
-                    error_code=ErrorCode.EXTRACTION_FAILED,
-                    message=f"Unsupported extractor strategy for rule '{rule.name}'.",
-                    detail=str(exc),
-                )
-            return
-
-        try:
-            extractor.validate_rule(rule)
-            result = await extractor.extract(context, rule)
-
-        except Exception as exc:
-            context.add_field_result(
-                name=rule.name,
-                output_field=rule.output_field,
-                strategy=rule.strategy,
-                success=False,
-                error_code=self._error_code_for_strategy(rule.strategy),
-                error_message=str(exc),
-            )
-
-            if rule.required and context.error is None:
-                context.set_error(
-                    error_code=ErrorCode.EXTRACTION_FAILED,
-                    message=f"Required rule '{rule.name}' failed during extraction.",
-                    detail=str(exc),
-                    suggestion="Inspect the page structure and update the extract rule.",
-                )
-            return
+        # Extractor contract note:
+        # This assumes the extractor can work from:
+        #   - page context
+        #   - extraction step
+        #   - optional record scope
+        # You will likely need a small adapter in the extractor layer.
+        result = await extractor.extract_entity_field(
+    context=context,
+    request=StepExtractionRequest(
+        field_name=field_plan.field_name,
+        step=step,
+        record_scope=scope,
+    ),
+)
 
         if result.success:
-            context.add_field_result(
-                name=rule.name,
-                output_field=rule.output_field,
-                strategy=rule.strategy,
+            draft.add_field_result(
+                field_name=field_plan.field_name,
+                strategy=step.strategy,
                 success=True,
                 value=result.value,
                 evidence=result.evidence,
                 selector_used=result.selector_used,
                 confidence=result.confidence,
             )
-            return
+            return True
 
-        context.add_field_result(
-            name=rule.name,
-            output_field=rule.output_field,
-            strategy=rule.strategy,
+        draft.add_field_result(
+            field_name=field_plan.field_name,
+            strategy=step.strategy,
             success=False,
             evidence=result.evidence,
             selector_used=result.selector_used,
-            error_code=self._error_code_for_strategy(rule.strategy),
+            error_code=self._error_code_for_strategy(step.strategy),
             error_message=result.error_message,
         )
+        return False
 
-        if rule.required and context.error is None:
-            context.set_error(
-                error_code=ErrorCode.EXTRACTION_FAILED,
-                message=f"Required rule '{rule.name}' did not produce a value.",
-                detail=result.error_message,
-                suggestion="Check selectors, page content, or extraction strategy.",
-            )
+    def _derive_entity_status(
+        self,
+        draft: EntityDraft,
+        required_identity_fields: list[str],
+    ) -> EntityRunStatus:
+        output = draft.output_map()
 
-    def _error_code_for_strategy(self, strategy) -> ErrorCode:
+        if draft.error is not None and not output:
+            return EntityRunStatus.FAILED
+
+        missing_required = [field for field in required_identity_fields if not output.get(field)]
+        if missing_required and not output:
+            return EntityRunStatus.FAILED
+
+        if missing_required:
+            return EntityRunStatus.PARTIAL_SUCCESS
+
+        return EntityRunStatus.SUCCESS
+
+    def _error_code_for_strategy(self, strategy: Any) -> ErrorCode:
         strategy_name = getattr(strategy, "value", str(strategy))
 
         if strategy_name == "selector":
@@ -453,52 +599,25 @@ class PageRunner:
     # ========================================================
 
     def _derive_page_status(self, context: PageRuntimeContext) -> PageRunStatus:
-        """
-        Determine final page status.
-
-        Rules:
-          - if a page-level error exists -> FAILED
-          - if any required extraction rule failed -> FAILED
-          - otherwise -> SUCCESS
-        """
         if context.error is not None:
             return PageRunStatus.FAILED
 
-        required_rule_names = {
-            rule.name
-            for rule in context.page.extract
-            if rule.required
-        }
-
-        if not required_rule_names:
+        if not context.page.entity_extractors:
             return PageRunStatus.SUCCESS
 
-        successful_required = {
-            result.name
-            for result in context.extracted_fields
-            if result.success and result.name in required_rule_names
-        }
-
-        missing_required = required_rule_names - successful_required
-        if missing_required:
-            context.log(
-                "Required extraction rule(s) missing: "
-                + ", ".join(sorted(missing_required))
-            )
+        if not context.entities:
             return PageRunStatus.FAILED
 
-        return PageRunStatus.SUCCESS
+        if any(entity.status in {EntityRunStatus.SUCCESS, EntityRunStatus.PARTIAL_SUCCESS} for entity in context.entities):
+            return PageRunStatus.SUCCESS
+
+        return PageRunStatus.FAILED
 
     # ========================================================
     # CLEANUP
     # ========================================================
 
     async def _cleanup_browser_resources(self, context: PageRuntimeContext) -> None:
-        """
-        Best-effort cleanup for browser-backed page runs.
-
-        Cleanup failures should not overwrite the real extraction/fetch result.
-        """
         if context.browser_page is None:
             return
 

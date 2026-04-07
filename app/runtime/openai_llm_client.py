@@ -58,6 +58,12 @@ class OpenAILLMClient(LLMClient):
         self,
         request: LLMGenerationRequest,
     ) -> LLMGenerationResponse:
+        if not request.content.strip():
+            return LLMGenerationResponse(
+                success=False,
+                error_message="LLM request content must not be empty.",
+            )
+
         system_prompt = (
             "You are a precise information extraction system. "
             "Return exactly one valid JSON object and no markdown. "

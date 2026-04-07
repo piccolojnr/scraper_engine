@@ -7,7 +7,7 @@ from pathlib import Path
 
 from app.config.registry import ConfigNotFoundError, registry
 from app.extractors.factory import ExtractorFactory
-from app.normalizers.default import DefaultUniversityNormalizer
+from app.normalizers.orchestrator import EntityRunNormalizer
 from app.runner.page_runner import PageRunner
 from app.runner.university_runner import UniversityRunner
 from app.runtime.browser_client import PlaywrightBrowserClient
@@ -15,6 +15,9 @@ from app.runtime.http_client import SimpleHttpClient
 from app.runtime.openai_llm_client import OpenAILLMClient
 from app.schemas.results import UniversityRunResult
 from app.settings import get_settings
+
+
+USER_AGENT = "UniScraper/2.0"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,20 +68,17 @@ async def run_once(
     registry.clear()
     registry.load_package(configs_package, Path(configs_dir))
     config = registry.get(config_id)
+
     settings = get_settings()
     llm_client = OpenAILLMClient.from_env()
 
     async with SimpleHttpClient(
-        default_headers={
-            "User-Agent": "UniScraper/1.0",
-        },
+        default_headers={"User-Agent": USER_AGENT},
         verify_ssl=settings.http_client.verify_ssl,
     ) as http_client, PlaywrightBrowserClient(
         headless=not headed,
         browser_type=browser,
-        default_headers={
-            "User-Agent": "UniScraper/1.0",
-        },
+        default_headers={"User-Agent": USER_AGENT},
     ) as browser_client:
         extractor_factory = ExtractorFactory(
             llm_client=llm_client,
@@ -92,7 +92,7 @@ async def run_once(
 
         university_runner = UniversityRunner(
             page_runner=page_runner,
-            normalizer=DefaultUniversityNormalizer(),
+            normalizer=EntityRunNormalizer(),
         )
 
         return await university_runner.run(config)
@@ -109,29 +109,55 @@ def print_summary(result: UniversityRunResult) -> None:
     for page_result in result.page_results:
         print(
             f"- {page_result.page_name} "
-            f"[{page_result.page_category.value}] "
+            f"[{page_result.page_type.value}/{page_result.intent.value}/{page_result.audience.value}] "
             f"=> {page_result.status.value}"
         )
 
-        for field in page_result.extracted_fields:
-            marker = "ok" if field.success else "fail"
+        entity_count = len(page_result.entities)
+        print(f"    • entities: {entity_count}")
+
+        for entity in page_result.entities:
             print(
-                f"    • {field.name} -> {field.output_field} "
-                f"[{field.strategy.value}] {marker}"
+                f"      - {entity.identity.entity_type.value} "
+                f"#{entity.identity.record_index} => {entity.status.value}"
             )
 
+            for field in entity.field_results:
+                marker = "ok" if field.success else "fail"
+                print(
+                    f"          • {field.field_name} "
+                    f"[{field.strategy.value}] {marker}"
+                )
+
+            if entity.error:
+                print(f"          ! entity error: {entity.error.error_code.value}")
+                print(f"            {entity.error.message}")
+
         if page_result.error:
-            print(f"    ! error: {page_result.error.error_code.value}")
+            print(f"    ! page error: {page_result.error.error_code.value}")
             print(f"      {page_result.error.message}")
 
-    if result.snapshot:
+    if result.normalized:
         print()
-        print("Snapshot:")
-        print(f"  status: {result.snapshot.status}")
-        print(f"  programmes: {len(result.snapshot.programmes)}")
-        print(f"  deadlines: {len(result.snapshot.deadlines)}")
-        print(f"  cut-offs: {len(result.snapshot.cut_off_points)}")
-        print(f"  scholarships: {len(result.snapshot.scholarships)}")
+        print("Normalized output:")
+        print(f"  university: {'yes' if result.normalized.university else 'no'}")
+        print(f"  portals: {len(result.normalized.portals)}")
+        print(f"  courses: {len(result.normalized.courses)}")
+
+        if result.normalized.university:
+            uni = result.normalized.university
+            print(f"  university.name: {uni.name}")
+            print(f"  university.country: {uni.country}")
+
+        if result.normalized.portals:
+            print("  portal titles:")
+            for portal in result.normalized.portals[:5]:
+                print(f"    - {portal.title} [{portal.status}]")
+
+        if result.normalized.courses:
+            print("  course names:")
+            for course in result.normalized.courses[:5]:
+                print(f"    - {course.name}")
 
     if result.errors:
         print()

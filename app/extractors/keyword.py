@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from app.config.models import ExtractRule, ExtractStrategy
-from app.extractors.base import BaseExtractor, ExtractionResult
+from app.config.models import ExtractStrategy
+from app.extractors.base import BaseStepExtractor, ExtractionResult, StepExtractionRequest
 from app.extractors.utils import (
     all_matching_selectors,
     document_text,
@@ -13,65 +13,54 @@ from app.extractors.utils import (
 from app.runtime.context import PageRuntimeContext
 
 
-class KeywordExtractor(BaseExtractor):
+class KeywordExtractor(BaseStepExtractor):
     """
     Extract a labeled value by matching configured keywords against text
     resolved from one or more selectors.
 
     Typical use case:
       - classify portal status as open / closed / upcoming
-
-    Behavior:
-      - tries selectors in order
-      - checks each matched selector block for a label match
-      - if no selector block matches, falls back to whole-document text
-      - returns the matched label as the extracted value
+      - infer degree level from local record content
     """
 
     name = "keyword"
-    version = "1"
+    version = "2"
 
-    def validate_rule(self, rule: ExtractRule) -> None:
-        if rule.strategy != ExtractStrategy.KEYWORD:
-            raise ValueError(
-                f"{self.__class__.__name__} only supports strategy='keyword'."
+    async def extract_entity_field(
+        self,
+        *,
+        context: PageRuntimeContext,
+        request: StepExtractionRequest,
+    ) -> ExtractionResult:
+        step = request.step
+        if step.strategy != ExtractStrategy.KEYWORD:
+            return self.make_failure_result(
+                error_message="KeywordExtractor only supports keyword steps."
             )
 
-        if rule.keyword_config is None:
-            raise ValueError("keyword_config is required for keyword extraction.")
+        if step.keyword_config is None:
+            return self.make_failure_result(
+                error_message="keyword_config is required for keyword extraction."
+            )
 
-        if not rule.keyword_config.selectors:
-            raise ValueError("keyword_config.selectors must not be empty.")
+        scoped_context = self.scoped_context(
+            context=context,
+            record_scope=request.record_scope,
+        )
 
-        if not rule.keyword_config.labels:
-            raise ValueError("keyword_config.labels must not be empty.")
-
-        if rule.many:
-            raise ValueError("keyword extraction does not support many=True.")
-
-    async def extract(
-        self,
-        context: PageRuntimeContext,
-        rule: ExtractRule,
-    ) -> ExtractionResult:
-        self.validate_rule(rule)
-
-        if not context.html:
+        if not scoped_context.html:
             return self.make_failure_result(
                 error_message="No HTML content available in page context."
             )
 
-        keyword_config = rule.keyword_config
-        assert keyword_config is not None  # typing
-
-        soup = parse_html(context.html)
+        keyword_config = step.keyword_config
+        soup = parse_html(scoped_context.html)
 
         labels = [
             (group.label, group.keywords)
             for group in keyword_config.labels
         ]
 
-        # 1. Try selector-scoped content first
         selected_blocks = all_matching_selectors(soup, keyword_config.selectors)
 
         for block in selected_blocks:
@@ -79,7 +68,7 @@ class KeywordExtractor(BaseExtractor):
                 block.text,
                 labels,
                 case_sensitive=keyword_config.case_sensitive,
-                match_mode=keyword_config.match_mode,
+                match_mode=keyword_config.match_mode.value,
             )
 
             if label is None or matched_keyword is None:
@@ -90,7 +79,8 @@ class KeywordExtractor(BaseExtractor):
                 selector_used=block.selector,
             )
             metadata = self.build_metadata(
-                rule=rule,
+                field_name=request.field_name,
+                step=step,
                 extraction_input=extraction_input,
             )
 
@@ -108,38 +98,29 @@ class KeywordExtractor(BaseExtractor):
                 metadata=metadata,
             )
 
-        # 2. Fall back to full document text
         full_text = document_text(soup)
         label, matched_keyword = first_matching_keyword_label(
             full_text,
             labels,
             case_sensitive=keyword_config.case_sensitive,
-            match_mode=keyword_config.match_mode,
+            match_mode=keyword_config.match_mode.value,
         )
-
-        if label is None or matched_keyword is None:
-            extraction_input = self.build_input(
-                content=full_text,
-                selector_used=None,
-            )
-            metadata = self.build_metadata(
-                rule=rule,
-                extraction_input=extraction_input,
-            )
-
-            return self.make_failure_result(
-                error_message="No configured keyword label matched the page content.",
-                metadata=metadata,
-            )
 
         extraction_input = self.build_input(
             content=full_text,
             selector_used=None,
         )
         metadata = self.build_metadata(
-            rule=rule,
+            field_name=request.field_name,
+            step=step,
             extraction_input=extraction_input,
         )
+
+        if label is None or matched_keyword is None:
+            return self.make_failure_result(
+                error_message="No configured keyword label matched the page content.",
+                metadata=metadata,
+            )
 
         evidence = snippet_around_match(
             full_text,
