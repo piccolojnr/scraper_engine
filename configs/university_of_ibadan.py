@@ -1,0 +1,513 @@
+from __future__ import annotations
+
+from typing import cast
+
+from pydantic import HttpUrl
+
+from app.config.models import (
+    AuditInfo,
+    AudienceLevel,
+    ConfigSource,
+    ConfigStatus,
+    ContentIntent,
+    DiscoveryRule,
+    DiscoveryStrategy,
+    EntityExtractionPlan,
+    EntityFieldPlan,
+    EntityType,
+    EntityValidationExpectation,
+    ExtractStrategy,
+    ExtractionStep,
+    FetchConfig,
+    FetchMode,
+    KeywordExtractConfig,
+    KeywordLabelGroup,
+    MatchMode,
+    PageConfig,
+    PageType,
+    PageValidationExpectation,
+    PatternExtractConfig,
+    PatternLabelGroup,
+    PortalFamily,
+    RecordLocator,
+    RecordMatchStrategy,
+    RequiredFieldExpectation,
+    SelectorExtractConfig,
+    UniversityProfile,
+    UniversityScraperConfig,
+)
+
+
+CONFIG = UniversityScraperConfig(
+    profile=UniversityProfile(
+        id="ui",
+        university_name="University of Ibadan",
+        country="Nigeria",
+        root_domains=[
+            "ui.edu.ng",
+            "admissions.ui.edu.ng",
+        ],
+        seed_urls=[
+            cast(HttpUrl, "https://ui.edu.ng/"),
+            cast(HttpUrl, "https://ui.edu.ng/content/vision-and-mission"),
+            cast(HttpUrl, "https://ui.edu.ng/content/university-ibadan-ibadan-nigeria-0"),
+            cast(HttpUrl, "https://ui.edu.ng/news/utme-direct-entry-acceptance-fee-payment-prospective-candidates-20252026-admission-exercise"),
+        ],
+        portal_family_hint=PortalFamily.DRUPAL,
+        tags=["nigeria", "admissions", "drupal"],
+    ),
+    audit=AuditInfo(
+        source=ConfigSource.MANUAL,
+        status=ConfigStatus.REVIEW_REQUIRED,
+        confidence=0.84,
+        version=1,
+        notes=(
+            "Initial University of Ibadan config based on current public UI pages. "
+            "Uses stable Drupal body selectors and a legacy programmes page."
+        ),
+    ),
+    discovery=[
+        DiscoveryRule(
+            name="ui-admissions-discovery",
+            strategy=DiscoveryStrategy.MIXED,
+            allowed_domains=["ui.edu.ng", "admissions.ui.edu.ng"],
+            include_url_patterns=[
+                r"/admissions",
+                r"/news",
+                r"/content",
+                r"/undergraduates",
+                r"/postgraduates",
+            ],
+            exclude_url_patterns=[
+                r"/wp-admin",
+                r"/wp-content",
+                r"/user/login",
+            ],
+            include_anchor_text=[
+                "admission",
+                "admissions",
+                "undergraduate",
+                "postgraduate",
+                "vision",
+                "mission",
+                "programme",
+                "course",
+            ],
+            exclude_anchor_text=[
+                "staff mail",
+                "lms",
+                "transcript",
+            ],
+            max_depth=2,
+            max_pages=25,
+        )
+    ],
+    pages=[
+        PageConfig(
+            name="ui_home",
+            type=PageType.LANDING,
+            intent=ContentIntent.PROFILE,
+            audience=AudienceLevel.GENERAL,
+            url=cast(HttpUrl, "https://ui.edu.ng/"),
+            canonical=True,
+            priority=1,
+            fetch=FetchConfig(mode=FetchMode.HTTP),
+            notes="University homepage used for base university metadata.",
+            entity_extractors=[
+                EntityExtractionPlan(
+                    name="ui_university_profile",
+                    entity_type=EntityType.UNIVERSITY,
+                    many=False,
+                    record_locator=RecordLocator(
+                        strategy=RecordMatchStrategy.SINGLE_RECORD
+                    ),
+                    required_identity_fields=["name"],
+                    fields=[
+                        EntityFieldPlan(
+                            field_name="name",
+                            required=True,
+                            steps=[
+                                ExtractionStep(
+                                    name="home_title",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=["title"]
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="website_url",
+                            steps=[
+                                ExtractionStep(
+                                    name="website_hint",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=['link[rel="canonical"]'],
+                                        attribute="href",
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="description",
+                            steps=[
+                                ExtractionStep(
+                                    name="home_summary",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=["section.page-wrapper", "body"]
+                                    ),
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
+            validation=PageValidationExpectation(
+                must_fetch=True,
+                min_text_length=100,
+                entities=[
+                    EntityValidationExpectation(
+                        entity_type=EntityType.UNIVERSITY,
+                        min_records=1,
+                        required_fields=[
+                            RequiredFieldExpectation(field="name"),
+                        ],
+                    )
+                ],
+            ),
+        ),
+        PageConfig(
+            name="ui_admissions_announcement",
+            type=PageType.CONTENT,
+            intent=ContentIntent.ADMISSIONS,
+            audience=AudienceLevel.UNDERGRADUATE,
+            url=cast(
+                HttpUrl,
+                "https://ui.edu.ng/news/utme-direct-entry-acceptance-fee-payment-prospective-candidates-20252026-admission-exercise",
+            ),
+            canonical=True,
+            priority=2,
+            fetch=FetchConfig(mode=FetchMode.HTTP),
+            notes="Public admissions notice used as the best available admissions portal/status source.",
+            entity_extractors=[
+                EntityExtractionPlan(
+                    name="ui_admissions_portal",
+                    entity_type=EntityType.PORTAL,
+                    many=False,
+                    record_locator=RecordLocator(
+                        strategy=RecordMatchStrategy.SINGLE_RECORD
+                    ),
+                    required_identity_fields=["title"],
+                    fields=[
+                        EntityFieldPlan(
+                            field_name="title",
+                            required=True,
+                            steps=[
+                                ExtractionStep(
+                                    name="admissions_title",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=["title"]
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="portal_url",
+                            steps=[
+                                ExtractionStep(
+                                    name="portal_url_pattern",
+                                    strategy=ExtractStrategy.PATTERN,
+                                    pattern_config=PatternExtractConfig(
+                                        selectors=["div.node-content", "div.field-item", "body"],
+                                        labels=[
+                                            PatternLabelGroup(
+                                                label="https://admissions.ui.edu.ng",
+                                                patterns=[r"(?:https?://)?admissions\.ui\.edu\.ng"],
+                                            )
+                                        ],
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="degree_level",
+                            steps=[
+                                ExtractionStep(
+                                    name="undergrad_label",
+                                    strategy=ExtractStrategy.KEYWORD,
+                                    keyword_config=KeywordExtractConfig(
+                                        selectors=["div.node-content", "body"],
+                                        labels=[
+                                            KeywordLabelGroup(
+                                                label="undergraduate",
+                                                keywords=["utme", "direct entry", "prospective candidates"],
+                                            )
+                                        ],
+                                        match_mode=MatchMode.CONTAINS,
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="status",
+                            steps=[
+                                ExtractionStep(
+                                    name="admissions_status",
+                                    strategy=ExtractStrategy.KEYWORD,
+                                    keyword_config=KeywordExtractConfig(
+                                        selectors=["div.node-content", "div.field-item", "body"],
+                                        labels=[
+                                            KeywordLabelGroup(
+                                                label="open",
+                                                keywords=[
+                                                    "portal is open",
+                                                    "applications are open",
+                                                    "registration ongoing",
+                                                ],
+                                            ),
+                                            KeywordLabelGroup(
+                                                label="closed",
+                                                keywords=[
+                                                    "no extension of the deadline",
+                                                    "portal closed",
+                                                    "applications are closed",
+                                                ],
+                                            ),
+                                            KeywordLabelGroup(
+                                                label="upcoming",
+                                                keywords=[
+                                                    "portal will open",
+                                                    "will open on",
+                                                    "opens on",
+                                                ],
+                                            ),
+                                        ],
+                                        match_mode=MatchMode.CONTAINS,
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="academic_year",
+                            steps=[
+                                ExtractionStep(
+                                    name="academic_year_pattern",
+                                    strategy=ExtractStrategy.PATTERN,
+                                    pattern_config=PatternExtractConfig(
+                                        selectors=["div.node-content", "title", "body"],
+                                        labels=[
+                                            PatternLabelGroup(
+                                                label="2025/2026",
+                                                patterns=[r"2025\s*/\s*2026"],
+                                            )
+                                        ],
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="fee_note",
+                            steps=[
+                                ExtractionStep(
+                                    name="fee_note_excerpt",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=["div.node-content", "div.field-item"]
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="instructions",
+                            steps=[
+                                ExtractionStep(
+                                    name="admissions_text",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=["div.node-content", "div.field-item"]
+                                    ),
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
+            validation=PageValidationExpectation(
+                must_fetch=True,
+                min_text_length=100,
+                entities=[
+                    EntityValidationExpectation(
+                        entity_type=EntityType.PORTAL,
+                        min_records=1,
+                        required_fields=[
+                            RequiredFieldExpectation(field="title"),
+                            RequiredFieldExpectation(field="status"),
+                        ],
+                    )
+                ],
+            ),
+        ),
+        PageConfig(
+            name="ui_programmes",
+            type=PageType.TABLE,
+            intent=ContentIntent.PROGRAMMES,
+            audience=AudienceLevel.UNDERGRADUATE,
+            url=cast(HttpUrl, "https://ui.edu.ng/content/university-ibadan-ibadan-nigeria-0"),
+            canonical=True,
+            priority=3,
+            fetch=FetchConfig(mode=FetchMode.HTTP),
+            notes="Legacy programmes page with approved undergraduate degree programmes in a table.",
+            entity_extractors=[
+                EntityExtractionPlan(
+                    name="ui_courses",
+                    entity_type=EntityType.COURSE,
+                    many=False,
+                    record_locator=RecordLocator(
+                        strategy=RecordMatchStrategy.SINGLE_RECORD
+                    ),
+                    required_identity_fields=["name"],
+                    fields=[
+                        EntityFieldPlan(
+                            field_name="name",
+                            required=True,
+                            steps=[
+                                ExtractionStep(
+                                    name="course_paragraphs",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=["table p"]
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="degree_level",
+                            steps=[
+                                ExtractionStep(
+                                    name="course_level_keyword",
+                                    strategy=ExtractStrategy.KEYWORD,
+                                    keyword_config=KeywordExtractConfig(
+                                        selectors=["div.node-content", "body"],
+                                        labels=[
+                                            KeywordLabelGroup(
+                                                label="undergraduate",
+                                                keywords=["undergraduate degree programmes", "utme", "direct entry"],
+                                            )
+                                        ],
+                                        match_mode=MatchMode.CONTAINS,
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="faculty",
+                            steps=[
+                                ExtractionStep(
+                                    name="faculty_labels",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=["table p"]
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="description",
+                            steps=[
+                                ExtractionStep(
+                                    name="programmes_page_excerpt",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=["div.node-content"]
+                                    ),
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
+            validation=PageValidationExpectation(
+                must_fetch=True,
+                min_text_length=100,
+                entities=[
+                    EntityValidationExpectation(
+                        entity_type=EntityType.COURSE,
+                        min_records=1,
+                        required_fields=[
+                            RequiredFieldExpectation(field="name"),
+                        ],
+                    )
+                ],
+            ),
+        ),
+        PageConfig(
+            name="ui_vision_mission",
+            type=PageType.CONTENT,
+            intent=ContentIntent.PROFILE,
+            audience=AudienceLevel.GENERAL,
+            url=cast(HttpUrl, "https://ui.edu.ng/content/vision-and-mission"),
+            canonical=True,
+            priority=4,
+            fetch=FetchConfig(mode=FetchMode.HTTP),
+            notes="Official vision and mission page for university profile enrichment.",
+            entity_extractors=[
+                EntityExtractionPlan(
+                    name="ui_profile_enrichment",
+                    entity_type=EntityType.UNIVERSITY,
+                    many=False,
+                    record_locator=RecordLocator(
+                        strategy=RecordMatchStrategy.SINGLE_RECORD
+                    ),
+                    required_identity_fields=["name"],
+                    fields=[
+                        EntityFieldPlan(
+                            field_name="name",
+                            required=True,
+                            steps=[
+                                ExtractionStep(
+                                    name="profile_title",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=["title"]
+                                    ),
+                                )
+                            ],
+                        ),
+                        EntityFieldPlan(
+                            field_name="description",
+                            steps=[
+                                ExtractionStep(
+                                    name="vision_mission_text",
+                                    strategy=ExtractStrategy.SELECTOR,
+                                    selector_config=SelectorExtractConfig(
+                                        selectors=[
+                                            "div.node-content",
+                                            "div.field.field-body.field-type-text-with-summary.field-label-hidden.field-item",
+                                            "section.page-wrapper",
+                                        ]
+                                    ),
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
+            validation=PageValidationExpectation(
+                must_fetch=True,
+                min_text_length=100,
+                entities=[
+                    EntityValidationExpectation(
+                        entity_type=EntityType.UNIVERSITY,
+                        min_records=1,
+                        required_fields=[
+                            RequiredFieldExpectation(field="name"),
+                        ],
+                    )
+                ],
+            ),
+        ),
+    ],
+)

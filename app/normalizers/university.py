@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from app.config.models import EntityType
 from app.normalizers.base import BaseEntityNormalizer
 from app.runtime.context import UniversityRuntimeContext
@@ -17,7 +19,8 @@ class UniversityEntityNormalizer(BaseEntityNormalizer):
 
         first = entities[0].output_map()
 
-        name = self.clean_str(first.get("name")) or context.university.profile.university_name
+        raw_name = self.clean_str(first.get("name"))
+        name = self._normalize_university_name(raw_name) or context.university.profile.university_name
         country = self.clean_str(first.get("country")) or context.university.profile.country
 
         return UniversityRecord(
@@ -39,3 +42,15 @@ class UniversityEntityNormalizer(BaseEntityNormalizer):
             raw_snippets=self.merge_raw_snippets(entities),
             confidence=self.average_confidence(entities),
         )
+
+    def _normalize_university_name(self, value: str | None) -> str | None:
+        text = self.clean_str(value)
+        if not text:
+            return None
+
+        text = re.sub(r"\s*\|\s*.*$", "", text).strip()
+        text = re.sub(r"\bhome\b", "", text, flags=re.IGNORECASE).strip(" -|")
+        if not text:
+            return None
+
+        return " ".join(part.capitalize() for part in text.split())

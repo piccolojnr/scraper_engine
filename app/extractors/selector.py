@@ -88,6 +88,42 @@ class SelectorExtractor(BaseStepExtractor):
                     metadata=metadata,
                 )
 
+        values, selector_used = text_list_from_selector(
+            soup,
+            selectors=selectors,
+        )
+        if values:
+            extraction_input = self.build_input(
+                content="\n".join(values),
+                selector_used=selector_used,
+            )
+            metadata = self.build_metadata(
+                field_name=request.field_name,
+                step=step,
+                extraction_input=extraction_input,
+            )
+            if len(values) == 1:
+                value = values[0]
+                evidence = snippet_around_match(
+                    scoped_context.text_content or scoped_context.html or "",
+                    value,
+                )
+                return self.make_success_result(
+                    value=value,
+                    evidence=evidence or value[:300],
+                    selector_used=selector_used,
+                    confidence=1.0,
+                    metadata=metadata,
+                )
+
+            return self.make_success_result(
+                value=values,
+                evidence=" | ".join(values[:5])[:500],
+                selector_used=selector_used,
+                confidence=1.0,
+                metadata=metadata,
+            )
+
         value, selector_used = single_value_from_selector(
             soup,
             selectors=selectors,
@@ -95,42 +131,6 @@ class SelectorExtractor(BaseStepExtractor):
         )
 
         if value is None:
-            values, selector_used = text_list_from_selector(
-                soup,
-                selectors=selectors,
-            )
-            if values:
-                extraction_input = self.build_input(
-                    content="\n".join(values),
-                    selector_used=selector_used,
-                )
-                metadata = self.build_metadata(
-                    field_name=request.field_name,
-                    step=step,
-                    extraction_input=extraction_input,
-                )
-                if len(values) == 1:
-                    value = values[0]
-                    evidence = snippet_around_match(
-                        scoped_context.text_content or scoped_context.html or "",
-                        value,
-                    )
-                    return self.make_success_result(
-                        value=value,
-                        evidence=evidence or value[:300],
-                        selector_used=selector_used,
-                        confidence=1.0,
-                        metadata=metadata,
-                    )
-
-                return self.make_success_result(
-                    value=values,
-                    evidence=" | ".join(values[:5])[:500],
-                    selector_used=selector_used,
-                    confidence=1.0,
-                    metadata=metadata,
-                )
-
             return self.make_failure_result(
                 error_message=f"No value matched selectors {selectors}."
             )
